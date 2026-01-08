@@ -29,15 +29,34 @@ func main() {
 		MaxMessageBytes: 64 * 1024,
 	}, m)
 
-	// Router Tanımları
+	// -------------------------------------------------------------------------
+	//  Router (Multiplexer) ve Endpoint Tanımları
+	// -------------------------------------------------------------------------
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
+
+	// [Health Check]
+	// Servisin ayakta olduğunu ve istek kabul edebildiğini doğrular.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// 200 OK döner, karmaşık mantık içermez (hızlı yanıt için).
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// [Observability]
+	// (Goroutine sayısı, WS bağlantı sayısı, bellek vb.) çekebilmesi için metrikleri sunar.
 	mux.Handle("/metrics", m.Handler())
+
+	// [WebSocket Endpoint]
+	// HTTP'den WebSocket protokolüne upgrade edilir.
 	mux.HandleFunc("/ws", ws.HandleWS)
 
+	// -------------------------------------------------------------------------
+	//  HTTP Sunucu Konfigürasyonu (Security Hardening)
+	// -------------------------------------------------------------------------
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
+		Addr:    addr, // Örn: :8083
+		Handler: mux,  // router
+
+		// [Güvenlik Kritik] Slowloris saldırılarına karşı koruma.
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
