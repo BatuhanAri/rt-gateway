@@ -10,82 +10,116 @@ import (
 	"syscall"
 	"time"
 
+	//paketler
 	"github.com/BatuhanAri/rt-gateway/internal/metrics"
 	"github.com/BatuhanAri/rt-gateway/internal/netws"
 )
 
 func main() {
-	// Konfigürasyon: Port ortam değişkeninden alınır, yoksa varsayılan :8083 kullanılır.
-	addr := envOr("RTG_ADDR", ":8083")
+	// Hangi portta
+	portAddress := envOr("RTG_ADDR", ":8083")
 
-	m := metrics.New()
-	// WebSocket Sunucu Ayarları (Güvenlik ve Performans limitleri)
-	ws := netws.NewServer(netws.Config{
-		ReadLimitBytes:  64 * 1024,        // Maksimum mesaj boyutu (64KB) - Bellek şişmesini önler.
-		PingInterval:    25 * time.Second, // Bağlantıyı canlı tutmak için ping sıklığı.
-		PongWait:        60 * time.Second, // Yanıt gelmezse bağlantıyı kesme süresi.
-		WriteTimeout:    5 * time.Second,  // Yazma işlemi için zaman aşımı.
-		CloseGrace:      2 * time.Second,  // Kapanış sırasında beklenecek süre.
-		MaxMessageBytes: 64 * 1024,
-	}, m)
+	// Metrikleri toplayacak olan objeyi oluşturuyorum.
+	// New()
+	metricSystem := metrics.New()
 
-	// -------------------------------------------------------------------------
-	//  Router (Multiplexer) ve Endpoint Tanımları
-	// -------------------------------------------------------------------------
-	mux := http.NewServeMux()
+	// WebSocket ayarları
+	// sunucu çökmesin diye limit koyuyoruz.
+	wsConfig := netws.Config{
+		ReadLimitBytes:  64 * 1024,        // 64 Kilobyte sınır koydum. Bundan büyük mesajları kabul etme.
+		PingInterval:    25 * time.Second, // Her 25 saniyede bir "orada mısın?" diye kontrol et (Ping).
+		PongWait:        60 * time.Second, // Eğer 60 saniye cevap gelmezse bağlantıyı kopar.
+		WriteTimeout:    5 * time.Second,  // Mesaj gönderirken en fazla 5 saniye bekle, takılmasın.
+		CloseGrace:      2 * time.Second,  // Kapatırken de hemen kesme, 2 saniye bekle.
+		MaxMessageBytes: 64 * 1024,        // Bu da maksimum mesaj boyutu yine.
+	}
 
-	// [Health Check]
-	// Servisin ayakta olduğunu ve istek kabul edebildiğini doğrular.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		// 200 OK döner, karmaşık mantık içermez (hızlı yanıt için).
-		_, _ = w.Write([]byte("ok"))
+	// WebSocket sunucusunu yukarıdaki ayarlarla ve metrik sistemiyle başlatıyorum.
+	webSocketServer := netws.NewServer(wsConfig, metricSystem)
+
+	// Router (Yönlendirici)
+	// Gelen istekleri doğru yere yönlendiriyor.
+	myRouter := http.NewServeMux()
+
+	// -- Endpointler (Adresler) --
+
+	// "/healthz" adresine istek gelince burası çalışacak.
+	// Bu sadece sunucunun çalışıp çalışmadığını kontrol etmek için basit bir kontrol.
+	myRouter.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Ekrana sadece "ok" yazıp bitiriyoruz. Hata kontrolü bile yapmadım hızlı olsun diye.
+		w.Write([]byte("ok"))
 	})
 
-	// [Observability]
-	// (Goroutine sayısı, WS bağlantı sayısı, bellek vb.) çekebilmesi için metrikleri sunar.
-	mux.Handle("/metrics", m.Handler())
+	// "/metrics" adresine gidince sistemin durumunu görebileceğiz.
+	// Goroutine sayısı, RAM kullanımı gibi bilgileri veriyor.
+	myRouter.Handle("/metrics", metricSystem.Handler())
 
-	// [WebSocket Endpoint]
-	// HTTP'den WebSocket protokolüne upgrade edilir.
-	mux.HandleFunc("/ws", ws.HandleWS)
+	// "/ws" adresi asıl işi yapan yer. WebSocket bağlantısı burada kuruluyor.
+	// http isteğini websocket'e çeviriyor (Upgrade ediyor).
+	myRouter.HandleFunc("/ws", webSocketServer.HandleWS)
 
-	// -------------------------------------------------------------------------
-	//  HTTP Sunucu Konfigürasyonu (Security Hardening)
-	// -------------------------------------------------------------------------
-	srv := &http.Server{
-		Addr:    addr, // Örn: :8083
-		Handler: mux,  // router
+	// Sunucu ayarları
+	// http.Server struct
+	server := &http.Server{
+		Addr:    portAddress, // Yukarıda belirlediğim port (8083)
+		Handler: myRouter,    // Hangi yönlendiriciyi kullanacak?
 
-		// [Güvenlik Kritik] Slowloris saldırılarına karşı koruma.
+		// "Slowloris" saldırısını engelliyo
+		// Header okumak için en fazla 5 saniye bekliyor.
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// Sunucuyu Başlat (Non-blocking)
+	// Sunucuyu başlatıyorum ama "go" ile başlatıyorum.
+	// Neden? Çünkü sunucu çalışırken aşağıdaki kodların da çalışmasını istiyorum (Shutdown için).
+	// Eğer "go" koymazsam program burada takılı kalır.
 	go func() {
-		log.Printf("listening on %s", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
+		log.Printf("Sunucu şu adreste dinlemeye başlıyor: %s", portAddress)
+
+		// ListenAndServe sunucuyu başlatır.
+		err := server.ListenAndServe()
+
+		// Eğer bir hata varsa ve bu hata "Sunucu Kapandı" hatası değilse ekrana basıp çık.
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Sunucu başlatılamadı hata var: %v", err)
 		}
 	}()
 
-	// Graceful shutdown
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	// Graceful Shutdown (Kibarca Kapatma)
+	// Programı CTRL+C ile kapatınca lap diye kapanmasın, işleri bitirsin diye bunu yapıyoruz.
 
-	// Mevcut işlemlerin tamamlanması için 5 saniye süre tanır.
+	// Bir kanal (channel) oluşturuyorum, sinyalleri dinleyecek.
+	stopChannel := make(chan os.Signal, 1)
+
+	// İşletim sistemine diyorum ki: "Biri programı durdurmaya çalışırsa (SIGINT, SIGTERM) bana haber ver".
+	signal.Notify(stopChannel, syscall.SIGINT, syscall.SIGTERM)
+
+	// Burada program bekliyor... Kanal'dan bir sinyal gelene kadar alt satıra geçmez.
+	<-stopChannel
+
+	// Sinyal geldi! Kapanma işlemi başlıyor.
+	log.Printf("Kapatma sinyali alındı, sunucu kapatılıyor...")
+
+	// Kapanırken maksimum 5 saniye beklesin diye zaman aşımı (timeout) oluşturuyorum.
+	// context.Background() boş bir context demek.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	// Fonksiyon bitince cancel çalışsın diye defer koydum (hafıza temizliği).
 	defer cancel()
 
-	log.Printf("shutting down...")
-	_ = srv.Shutdown(ctx)
-	log.Printf("bye")
+	// Shutdown fonksiyonu ile sunucuyu nazikçe kapatıyorum.
+	// Şu an açık olan bağlantıların bitmesini bekliyor (ama en fazla 5 sn).
+	_ = server.Shutdown(ctx)
+
+	log.Printf("Program bitti.")
 }
 
-// envOr ortam değişkenini okur, boşsa varsayılan değeri döndürür.
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// YARDIMCI FONKSİYON
+// Ortam değişkeni
+// Eğer key (anahtar) varsa onu döndürür, yoksa default (varsayılan) değeri döndürür.
+func envOr(key string, defaultValue string) string {
+	val := os.Getenv(key)
+	if val != "" {
+		return val // Değer varsa onu döndür
 	}
-	return def
+	return defaultValue // Yoksa varsayılanı döndür
 }
